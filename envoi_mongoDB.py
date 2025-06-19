@@ -5,20 +5,19 @@ from pymongo import MongoClient
 from dotenv import load_dotenv
 from datetime import datetime
 from fpdf import FPDF
+from pymongo.errors import ServerSelectionTimeoutError, AutoReconnect
 
-# === CONFIGURATION ===
+# === 📌 CONFIGURATION ===
 load_dotenv()
 MONGO_URI = os.getenv("MONGO_URI")
-
-CHEMIN_SAUVEGARDE = "B:\Marine Weather Data\Data Update"
+CHEMIN_SAUVEGARDE = "C:\\Valeport Software\\TideMaster Express\\Data\\Daily"
 TAILLE_LIMITE_MB = 400
 DOSSIER_PDF = "rapports_pdf"
-OFFLINE_BUFFER_PATH = "offline_buffer.json"
 
 coordonnees_stations = {
-    "SM 2": {"Longitude": 9.7095, "Latitude": 4.0603},
-    "SM 3": {"Longitude": 9.7100, "Latitude": 4.0610},
-    "SM 4": {"Longitude": 9.7110, "Latitude": 4.0620},
+    "SM 2": {"Longitude": 9.4950, "Latitude": 3.9165},
+    "SM 3": {"Longitude": 9.5877, "Latitude": 3.9916},
+    "SM 4": {"Longitude": 9.6857, "Latitude": 4.0539},
 }
 
 parametres = [
@@ -75,13 +74,10 @@ def fusionner_donnees_station(station):
     return df_merged.dropna()
 
 def taille_bdd(client):
-    try:
-        stats = client["meteo_douala"].command("dbstats")
-        taille_MB = stats["storageSize"] / (1024 * 1024)
-        print(f"📦 Taille MongoDB : {taille_MB:.2f} Mo")
-        return taille_MB
-    except Exception:
-        return 0
+    stats = client["meteo_douala"].command("dbstats")
+    taille_MB = stats["storageSize"] / (1024 * 1024)
+    print(f"📦 Taille MongoDB : {taille_MB:.2f} Mo")
+    return taille_MB
 
 def sauvegarder_et_vider(collection):
     print("⚠️ Taille limite dépassée. Sauvegarde en cours...")
@@ -99,60 +95,30 @@ def sauvegarder_et_vider(collection):
     else:
         print("ℹ️ Aucune donnée à sauvegarder.")
 
-def sauvegarder_buffer_local(df):
-    if df.empty:
-        return
-    try:
-        if os.path.exists(OFFLINE_BUFFER_PATH):
-            old = pd.read_json(OFFLINE_BUFFER_PATH, convert_dates=["DateTime"])
-            df = pd.concat([old, df], ignore_index=True).drop_duplicates()
-        df.to_json(OFFLINE_BUFFER_PATH, orient="records", date_format="iso")
-        print(f"📥 Données stockées localement dans {OFFLINE_BUFFER_PATH}")
-    except Exception as e:
-        print(f"❌ Erreur buffer local: {e}")
-
-def vider_buffer_local():
-    if not os.path.exists(OFFLINE_BUFFER_PATH):
-        return pd.DataFrame()
-    try:
-        df = pd.read_json(OFFLINE_BUFFER_PATH, convert_dates=["DateTime"])
-        os.remove(OFFLINE_BUFFER_PATH)
-        print("🧹 Données locales restaurées.")
-        return df
-    except Exception as e:
-        print(f"❌ Lecture buffer local : {e}")
-        return pd.DataFrame()
-
 def inserer_dans_mongo(df, collection):
     if df.empty:
         return
-
-    try:
-        df_buffer = vider_buffer_local()
-        if not df_buffer.empty:
-            df = pd.concat([df, df_buffer], ignore_index=True).drop_duplicates()
-
-        docs_existants = set(
-            (d["DateTime"], d["Station"]) for d in collection.find(
-                {"DateTime": {"$in": df["DateTime"].tolist()}},
-                {"_id": 0, "DateTime": 1, "Station": 1}
-            )
+    docs_existants = set(
+        (d["DateTime"], d["Station"]) for d in collection.find(
+            {"DateTime": {"$in": df["DateTime"].tolist()}},
+            {"_id": 0, "DateTime": 1, "Station": 1}
         )
-        df_unique = df[~df.apply(lambda row: (row["DateTime"], row["Station"]) in docs_existants, axis=1)]
-
-        if df_unique.empty:
-            print("⏳ Rien à insérer.")
-            return
-
+    )
+    df_unique = df[~df.apply(lambda row: (row["DateTime"], row["Station"]) in docs_existants, axis=1)]
+    if df_unique.empty:
+        print("⏳ Aucun nouveau document à insérer.")
+        return
+    try:
         collection.insert_many(df_unique.to_dict(orient="records"))
         print(f"✅ {len(df_unique)} documents insérés.")
     except Exception as e:
-        print(f"🔌 MongoDB inaccessible. Sauvegarde locale. ({e})")
-        sauvegarder_buffer_local(df)
+        print(f"❌ Erreur insertion MongoDB : {e}")
 
 def generer_rapport_pdf(df, station):
     if df.empty:
+        print(f"📭 Aucun rapport PDF pour {station}.")
         return
+
     date_du_jour = datetime.now().strftime("%Y-%m-%d")
     fichier_pdf = os.path.join(DOSSIER_PDF, f"rapport_{station}_{datetime.now().strftime('%Y%m%d')}.pdf")
     coords = coordonnees_stations.get(station, {"Longitude": "N/A", "Latitude": "N/A"})
@@ -164,8 +130,9 @@ def generer_rapport_pdf(df, station):
     pdf.add_page()
     pdf.set_font("Arial", "B", 16)
 
-    if os.path.exists("logo_pad.png"):
-        pdf.image("logo_pad.png", 10, 8, 33)
+    logo_path = "logo_pad.png"
+    if os.path.exists(logo_path):
+        pdf.image(logo_path, 10, 8, 33)
     pdf.cell(80)
     pdf.cell(30, 10, f"Rapport météo - {station}", ln=True, align="C")
     pdf.set_font("Arial", "", 12)
@@ -175,26 +142,25 @@ def generer_rapport_pdf(df, station):
     pdf.ln(5)
 
     pdf.set_font("Arial", "B", 12)
-    col_widths = [40] + [30] * (len(stats.columns) - 1)
-    for i, col in enumerate(stats.columns):
-        pdf.cell(col_widths[i], 10, col, 1, 0, "C")
+    for col in stats.columns:
+        pdf.cell(40, 10, col, 1, 0, "C")
     pdf.ln()
 
     pdf.set_font("Arial", "", 11)
     for _, row in stats.iterrows():
-        for i, val in enumerate(row):
-            pdf.cell(col_widths[i], 10, str(val), 1, 0, "C")
+        for val in row:
+            pdf.cell(40, 10, str(val), 1, 0, "C")
         pdf.ln()
 
     pdf.output(fichier_pdf)
     print(f"📝 Rapport PDF généré : {fichier_pdf}")
 
 def boucle_suivi():
-    print("🟢 Suivi en temps réel... Ctrl+C pour arrêter.")
+    print("🟢 Suivi en cours... Ctrl+C pour quitter.")
     while True:
         try:
             client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=3000)
-            client.server_info()  # test connexion
+            client.server_info()
             db = client["meteo_douala"]
             collection = db["donnees_meteo"]
 
@@ -206,18 +172,17 @@ def boucle_suivi():
                 inserer_dans_mongo(df, collection)
                 generer_rapport_pdf(df, station)
 
-            time.sleep(1)  # ✅ Retour à une fréquence normale une fois connecté
-
-        except Exception as e:
-            print(f"🔌 Pas de connexion. Attente de retour réseau... ({e})")
+            time.sleep(10)  # ⏱ Normal delay
+        except (ServerSelectionTimeoutError, AutoReconnect, OSError) as e:
+            print(f"🔌 Connexion perdue. Attente de retour réseau... ({e})")
             while True:
                 try:
                     client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=3000)
                     client.server_info()
-                    print("🔁 Connexion MongoDB rétablie.")
+                    print("🔁 Connexion rétablie.")
                     break
                 except:
-                    print("⏳ En attente de connexion réseau...")
+                    print("⏳ Toujours hors ligne... Réessai dans 5 secondes.")
                     time.sleep(5)
 
 if __name__ == "__main__":
