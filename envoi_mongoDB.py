@@ -192,7 +192,7 @@ def boucle_suivi():
             if taille_bdd(client) > TAILLE_LIMITE_MB:
                 sauvegarder_et_vider(collection)
 
-            for station in ["SM 2", "SM 3", "SM 4"]:
+            for station in ["SM 1", "SM 2","SM 3", "SM 4"]:
                 df = fusionner_donnees_station(station)
                 inserer_dans_mongo(df, collection)
                 generer_rapport_pdf(df, station)
