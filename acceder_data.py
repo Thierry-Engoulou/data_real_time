@@ -4,6 +4,7 @@ from flask_cors import CORS
 from dotenv import load_dotenv
 import os
 from datetime import datetime
+CORS(app, resources={r"/*": {"origins": "http://localhost:5173"}})
 
 # Charger les variables d'environnement
 load_dotenv()
