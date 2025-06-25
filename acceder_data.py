@@ -4,7 +4,7 @@ from flask_cors import CORS
 from dotenv import load_dotenv
 import os
 from datetime import datetime
-CORS(app, resources={r"/*": {"origins": "http://localhost:5173"}})
+
 
 # Charger les variables d'environnement
 load_dotenv()
@@ -17,7 +17,7 @@ collection = db["donnees_meteo"]
 
 # Initialiser Flask
 app = Flask(__name__)
-
+CORS(app, resources={r"/*": {"origins": "http://localhost:5173"}})
 # === Route par défaut ===
 @app.route("/")
 def home():
