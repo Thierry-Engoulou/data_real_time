@@ -7,6 +7,9 @@ from datetime import datetime
 from fpdf import FPDF
 from pymongo.errors import ServerSelectionTimeoutError, AutoReconnect, ConfigurationError
 
+# MODIF : filtre pour lisser la marée (sinusoïde)
+from scipy.signal import savgol_filter
+
 # === 📌 CONFIGURATION ===
 load_dotenv()
 MONGO_URI = os.getenv("MONGO_URI")
@@ -26,8 +29,6 @@ parametres = [
     "DEWPOINT", "WIND SPEED", "WIND DIR", "SURGE", "TIDE HEIGHT"
 ]
 
-# Définition des plages de valeurs valides
-# Format : (valeur_min, valeur_max, unité)
 plages_valides = {
     "AIR TEMPERATURE": (-2, 50, "°C"),
     "AIR PRESSURE": (900, 1100, "hPa"),
@@ -36,7 +37,7 @@ plages_valides = {
     "WIND SPEED": (0, 150, "m/s"),
     "WIND DIR": (0, 360, "°"),
     "SURGE": (1, 5, "m"),
-    "TIDE HEIGHT": (1, 16, "m"),
+    "TIDE HEIGHT": (0, 16, "m"),
 }
 
 fichier_positions = {}
@@ -67,7 +68,31 @@ def lire_fichier_param(station, param):
         df = df[df[param] != "9999.999"]
         df["DateTime"] = pd.to_datetime(df["Date"] + " " + df["Time"],
                                         format="%d/%m/%Y %H:%M:%S", errors="coerce")
-        return df[["DateTime", param]].dropna()
+
+        df[param] = pd.to_numeric(df[param], errors="coerce")
+        df = df[["DateTime", param]].dropna()
+
+        # ============================
+        # MODIF : TRAITEMENT MARÉE
+        # ============================
+        if param == "TIDE HEIGHT":
+
+            df = df.set_index("DateTime")
+
+            # MODIF : forcer pas de temps 5 minutes
+            df = df.resample("5min").mean().interpolate()
+
+            # MODIF : supprimer sauts non physiques (>1 m en 5 min)
+            df = df[(df[param].diff().abs() < 1) | (df[param].diff().isna())]
+
+            # MODIF : lissage sinusoïdal
+            if len(df) >= 11:  # fenêtre impaire obligatoire
+                df[param] = savgol_filter(df[param], window_length=11, polyorder=2)
+
+            df = df.reset_index()
+
+        return df
+
     except Exception as e:
         print(f"❌ Erreur lecture {nom_fichier} : {e}")
         return pd.DataFrame()
@@ -78,24 +103,26 @@ def fusionner_donnees_station(station):
         df = lire_fichier_param(station, param)
         if df.empty:
             continue
-        # Conversion des valeurs en numérique (si ce n'est déjà fait)
-        df[param] = pd.to_numeric(df[param], errors="coerce")
         dfs.append(df)
+
     if not dfs:
         return pd.DataFrame()
+
     df_merged = dfs[0]
     for df in dfs[1:]:
         df_merged = pd.merge(df_merged, df, on="DateTime", how="outer")
+
     df_merged["Station"] = station
     df_merged["Longitude"] = coordonnees_stations[station]["Longitude"]
     df_merged["Latitude"] = coordonnees_stations[station]["Latitude"]
+
     df_merged = df_merged.dropna()
 
-    # Filtrage selon les plages de données valides
     for param in parametres:
         if param in df_merged.columns and param in plages_valides:
             min_val, max_val, unit = plages_valides[param]
             df_merged = df_merged[(df_merged[param] >= min_val) & (df_merged[param] <= max_val)]
+
     return df_merged
 
 def taille_bdd(client):
@@ -185,19 +212,19 @@ def boucle_suivi():
     while True:
         try:
             client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=3000)
-            client.server_info()  # Vérifie la connexion
+            client.server_info()
             db = client["meteo_douala"]
             collection = db["donnees_meteo"]
 
             if taille_bdd(client) > TAILLE_LIMITE_MB:
                 sauvegarder_et_vider(collection)
 
-            for station in ["SM 1", "SM 2","SM 3", "SM 4"]:
+            for station in ["SM 1", "SM 2", "SM 3", "SM 4"]:
                 df = fusionner_donnees_station(station)
                 inserer_dans_mongo(df, collection)
                 generer_rapport_pdf(df, station)
 
-            time.sleep(10)  # ⏱ Délai normal
+            time.sleep(10)
 
         except (ServerSelectionTimeoutError, AutoReconnect, OSError, ConfigurationError) as e:
             print(f"🔌 Connexion perdue. Attente de retour réseau... ({e})")
