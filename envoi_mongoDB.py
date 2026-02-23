@@ -62,7 +62,7 @@ def lire_lignes_incrementales(nom_fichier):
         return []
 
 def lire_fichier_param(station, param):
-    nom_fichier = f"{station} {param}.txt"
+    nom_fichier = os.path.join(CHEMIN_SAUVEGARDE, f"{station} {param}.txt")  # ✅ CORRIGÉ
     lignes = lire_lignes_incrementales(nom_fichier)
     if not lignes:
         return pd.DataFrame()
@@ -87,7 +87,12 @@ def lire_fichier_param(station, param):
         if param == "TIDE HEIGHT":
             df = df.set_index("DateTime")
             df = df.resample("5min").mean().interpolate()
+
+            # suppression sauts non physiques
             df = df[(df[param].diff().abs() < 1) | (df[param].diff().isna())]
+
+            # 🔁 re-interpolation pour garder grille 5 min
+            df = df.resample("5min").mean().interpolate()
 
             if len(df) >= 11:
                 df[param] = savgol_filter(df[param], window_length=11, polyorder=2)
@@ -148,19 +153,19 @@ def inserer_dans_mongo(df, collection):
     if df.empty:
         return
 
-    docs_existants = set(
+    existants = set(
         (d["DateTime"], d["Station"])
         for d in collection.find(
-            {"DateTime": {"$in": df["DateTime"].tolist()}},
+            {
+                "DateTime": {"$in": df["DateTime"].tolist()},
+                "Station": {"$in": df["Station"].tolist()}
+            },
             {"_id": 0, "DateTime": 1, "Station": 1}
         )
     )
 
     df_unique = df[
-        ~df.apply(
-            lambda row: (row["DateTime"], row["Station"]) in docs_existants,
-            axis=1
-        )
+        ~df.apply(lambda row: (row["DateTime"], row["Station"]) in existants, axis=1)
     ]
 
     if df_unique.empty:
