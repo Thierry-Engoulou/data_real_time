@@ -6,13 +6,14 @@ from dotenv import load_dotenv
 from datetime import datetime
 from fpdf import FPDF
 from pymongo.errors import ServerSelectionTimeoutError, AutoReconnect, ConfigurationError
-import certifi  # <-- Ajout pour SSL
-# --------------------------------------------------------------------
+import certifi
 
+# --------------------------------------------------------------------
 # === 📌 CONFIGURATION ===
+# --------------------------------------------------------------------
 load_dotenv()
 MONGO_URI = os.getenv("MONGO_URI")
-CHEMIN_SAUVEGARDE = "E:\Marine Weather Data\Data Update\data_classe\save_bd"   
+CHEMIN_SAUVEGARDE = "E:\\Marine Weather Data\\Data Update\\data_classe\\save_bd"
 TAILLE_LIMITE_MB = 400
 DOSSIER_PDF = "rapports_pdf"
 
@@ -28,7 +29,6 @@ parametres = [
     "DEWPOINT", "WIND SPEED", "WIND DIR", "SURGE", "TIDE HEIGHT"
 ]
 
-# Plages de valeurs valides
 plages_valides = {
     "AIR TEMPERATURE": (-2, 50, "°C"),
     "AIR PRESSURE": (900, 1100, "hPa"),
@@ -47,7 +47,6 @@ if not os.path.exists(DOSSIER_PDF):
 # --------------------------------------------------------------------
 # 📌 LECTURE DES FICHIERS
 # --------------------------------------------------------------------
-
 def lire_lignes_incrementales(nom_fichier):
     if nom_fichier not in fichier_positions:
         fichier_positions[nom_fichier] = 0
@@ -67,44 +66,80 @@ def lire_fichier_param(station, param):
     if not lignes:
         return pd.DataFrame()
     try:
-        df = pd.DataFrame([l.strip().split("\t") for l in lignes],
-                          columns=["Date", "Time", param, "SD"])
+        df = pd.DataFrame(
+            [l.strip().split("\t") for l in lignes],
+            columns=["Date", "Time", param, "SD"]
+        )
         df = df[df[param] != "9999.999"]
-        df["DateTime"] = pd.to_datetime(df["Date"] + " " + df["Time"],
-                                        format="%d/%m/%Y %H:%M:%S", errors="coerce")
+        df["DateTime"] = pd.to_datetime(
+            df["Date"] + " " + df["Time"],
+            format="%d/%m/%Y %H:%M:%S",
+            errors="coerce"
+        )
         return df[["DateTime", param]].dropna()
     except Exception as e:
         print(f"❌ Erreur lecture {nom_fichier} : {e}")
         return pd.DataFrame()
 
+# --------------------------------------------------------------------
+# 📌 NETTOYAGE ET LISSEMENT
+# --------------------------------------------------------------------
+def nettoyer_tide(df, param="TIDE HEIGHT", window=7):
+    if param not in df.columns or df.empty:
+        return df
+    df[param] = pd.to_numeric(df[param], errors="coerce")
+    df = df.dropna(subset=[param])
+    df[param + "_med"] = df[param].rolling(window=window, center=True).median()
+    df[param + "_smooth"] = df[param + "_med"].rolling(window=window, center=True).mean()
+    df[param + "_smooth"].fillna(df[param], inplace=True)
+    df[param] = df[param + "_smooth"]
+    df.drop(columns=[param + "_med", param + "_smooth"], inplace=True)
+    return df
+
+def nettoyer_autres(df, window=3):
+    for param in parametres:
+        if param in df.columns and param != "TIDE HEIGHT":
+            df[param] = pd.to_numeric(df[param], errors="coerce")
+            df[param] = df[param].rolling(window=window, center=True).mean().fillna(df[param])
+    return df
+
+# --------------------------------------------------------------------
+# 📌 FUSION DES DONNÉES PAR STATION
+# --------------------------------------------------------------------
 def fusionner_donnees_station(station):
     dfs = []
     for param in parametres:
         df = lire_fichier_param(station, param)
         if df.empty:
             continue
-        df[param] = pd.to_numeric(df[param], errors="coerce")
         dfs.append(df)
     if not dfs:
         return pd.DataFrame()
+    
     df_merged = dfs[0]
     for df in dfs[1:]:
         df_merged = pd.merge(df_merged, df, on="DateTime", how="outer")
+    
     df_merged["Station"] = station
     df_merged["Longitude"] = coordonnees_stations[station]["Longitude"]
     df_merged["Latitude"] = coordonnees_stations[station]["Latitude"]
-    df_merged = df_merged.dropna()
-
+    
+    # Nettoyage / lissage avant filtrage
+    df_merged = nettoyer_tide(df_merged, "TIDE HEIGHT", window=7)
+    df_merged = nettoyer_autres(df_merged, window=3)
+    
+    # Filtrage des plages valides avec conversion numérique
     for param in parametres:
         if param in df_merged.columns and param in plages_valides:
-            min_val, max_val, unit = plages_valides[param]
+            df_merged[param] = pd.to_numeric(df_merged[param], errors='coerce')
+            min_val, max_val, _ = plages_valides[param]
             df_merged = df_merged[(df_merged[param] >= min_val) & (df_merged[param] <= max_val)]
-    return df_merged
+    
+    return df_merged.dropna()
 
 # --------------------------------------------------------------------
 # 📌 MONGODB + SAUVEGARDE
 # --------------------------------------------------------------------
-
 def taille_bdd(client):
     stats = client["meteo_douala"].command("dbstats")
     taille_MB = stats["storageSize"] / (1024 * 1024)
@@ -131,7 +166,8 @@ def inserer_dans_mongo(df, collection):
     if df.empty:
         return
     docs_existants = set(
-        (d["DateTime"], d["Station"]) for d in collection.find(
+        (d["DateTime"], d["Station"])
+        for d in collection.find(
             {"DateTime": {"$in": df["DateTime"].tolist()}},
             {"_id": 0, "DateTime": 1, "Station": 1}
         )
@@ -149,26 +185,24 @@ def inserer_dans_mongo(df, collection):
 # --------------------------------------------------------------------
 # 📌 GENERATION PDF
 # --------------------------------------------------------------------
-
 def generer_rapport_pdf(df, station):
     if df.empty:
         print(f"📭 Aucun rapport PDF pour {station}.")
         return
-
     date_du_jour = datetime.now().strftime("%Y-%m-%d")
     fichier_pdf = os.path.join(DOSSIER_PDF, f"rapport_{station}_{datetime.now().strftime('%Y%m%d')}.pdf")
     coords = coordonnees_stations.get(station, {"Longitude": "N/A", "Latitude": "N/A"})
-
+    
     stats = df.describe().loc[["mean", "min", "max"]].round(2).reset_index()
     stats.rename(columns={"index": "Statistique"}, inplace=True)
-
+    
     pdf = FPDF()
     pdf.add_page()
     pdf.set_font("Arial", "B", 16)
-
     logo_path = "logo_pad.png"
     if os.path.exists(logo_path):
         pdf.image(logo_path, 10, 8, 33)
+    
     pdf.cell(80)
     pdf.cell(30, 10, f"Rapport météo - {station}", ln=True, align="C")
     pdf.set_font("Arial", "", 12)
@@ -176,27 +210,25 @@ def generer_rapport_pdf(df, station):
     pdf.cell(0, 10, f"Date : {date_du_jour}", ln=True)
     pdf.cell(0, 10, f"Coordonnées : Lat {coords['Latitude']} / Lon {coords['Longitude']}", ln=True)
     pdf.ln(5)
-
+    
     pdf.set_font("Arial", "B", 12)
     for col in stats.columns:
         pdf.cell(40, 10, col, 1, 0, "C")
     pdf.ln()
-
+    
     pdf.set_font("Arial", "", 11)
     for _, row in stats.iterrows():
         for val in row:
             pdf.cell(40, 10, str(val), 1, 0, "C")
         pdf.ln()
-
+    
     pdf.output(fichier_pdf)
     print(f"📝 Rapport PDF généré : {fichier_pdf}")
 
 # --------------------------------------------------------------------
 # 📌 BOUCLE PRINCIPALE
 # --------------------------------------------------------------------
-
 def connexion_mongo():
-    """Connexion MongoDB avec TLS + Certifi."""
     return MongoClient(
         MONGO_URI,
         serverSelectionTimeoutMS=3000,
@@ -208,22 +240,22 @@ def boucle_suivi():
     print("🟢 Suivi en cours... Ctrl+C pour quitter.")
     while True:
         try:
-            client = connexion_mongo()  # <--- Connexion TLS sécurisée
-            client.server_info()  
-
+            client = connexion_mongo()
+            client.server_info()
+            
             db = client["meteo_douala"]
             collection = db["donnees_meteo"]
-
+            
             if taille_bdd(client) > TAILLE_LIMITE_MB:
                 sauvegarder_et_vider(collection)
-
+            
             for station in ["SM 1", "SM 2", "SM 3", "SM 4"]:
                 df = fusionner_donnees_station(station)
                 inserer_dans_mongo(df, collection)
                 generer_rapport_pdf(df, station)
-
+            
             time.sleep(10)
-
+        
         except (ServerSelectionTimeoutError, AutoReconnect, OSError, ConfigurationError) as e:
             print(f"🔌 Connexion perdue. Attente réseau... ({e})")
             while True:
