@@ -1,24 +1,16 @@
 # ==========================================================
-# VERSION FINALE STABLE 24H/24
+# SYSTEME MAREGRAPHIQUE 24H/24 – VERSION FINALE COMPLETE
 # ==========================================================
 
-import os
-import time
-import gc
+import os, time
 import pandas as pd
 import numpy as np
-from pymongo import MongoClient
+from pymongo import MongoClient, UpdateOne
 from dotenv import load_dotenv
 from datetime import datetime
-from fpdf import FPDF
 from pymongo.errors import ServerSelectionTimeoutError, AutoReconnect, ConfigurationError
 from scipy.signal import savgol_filter
 import certifi
-
-# 🔒 IMPORTANT : backend non graphique (évite erreur Tkinter)
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 
 # ==========================================================
 # CONFIGURATION
@@ -26,10 +18,6 @@ import matplotlib.pyplot as plt
 
 load_dotenv()
 MONGO_URI = os.getenv("MONGO_URI")
-
-DOSSIER_PDF = "rapports_pdf"
-if not os.path.exists(DOSSIER_PDF):
-    os.makedirs(DOSSIER_PDF)
 
 coordonnees_stations = {
     "SM 1": {"Longitude": 9.4601, "Latitude": 3.8048},
@@ -39,115 +27,198 @@ coordonnees_stations = {
 }
 
 parametres = [
-    "AIR TEMPERATURE", "AIR PRESSURE", "HUMIDITY",
-    "DEWPOINT", "WIND SPEED", "WIND DIR",
-    "SURGE", "TIDE HEIGHT"
+    "AIR TEMPERATURE","AIR PRESSURE","HUMIDITY","DEWPOINT",
+    "WIND SPEED","WIND DIR","SURGE","TIDE HEIGHT"
 ]
 
 plages_valides = {
-    "AIR TEMPERATURE": (-2, 50),
-    "AIR PRESSURE": (900, 1100),
-    "HUMIDITY": (0, 100),
-    "DEWPOINT": (-60, 60),
-    "WIND SPEED": (0, 150),
-    "WIND DIR": (0, 360),
-    "SURGE": (1, 5),
-    "TIDE HEIGHT": (0, 16),
+    "AIR TEMPERATURE": (-2,50),
+    "AIR PRESSURE": (900,1100),
+    "HUMIDITY": (0,100),
+    "DEWPOINT": (-60,60),
+    "WIND SPEED": (0,150),
+    "WIND DIR": (0,360),
+    "SURGE": (1,5),
+    "TIDE HEIGHT": (0,16),
 }
 
 fichier_positions = {}
 
 # ==========================================================
-# LECTURE FICHIERS
+# OUTILS TAILLE BASE
+# ==========================================================
+
+def convertir_taille_octets(taille):
+    if taille < 1024:
+        return f"{taille} o"
+    elif taille < 1024**2:
+        return f"{taille/1024:.2f} Ko"
+    elif taille < 1024**3:
+        return f"{taille/1024**2:.2f} Mo"
+    else:
+        return f"{taille/1024**3:.2f} Go"
+
+def afficher_statistiques_base(client, db, collection):
+
+    print("\n📊 ===== STATISTIQUES BASE =====")
+
+    total_docs = collection.count_documents({})
+    print(f"📦 Total documents : {total_docs}")
+
+    stats = db.command("dbStats")
+
+    print(f"💾 Données : {convertir_taille_octets(stats.get('dataSize',0))}")
+    print(f"🗄️ Stockage : {convertir_taille_octets(stats.get('storageSize',0))}")
+    print(f"📁 Total base : {convertir_taille_octets(stats.get('totalSize',0))}")
+
+    pipeline = [
+        {"$group": {"_id": "$Station", "count": {"$sum": 1}}},
+        {"$sort": {"_id": 1}}
+    ]
+
+    for r in collection.aggregate(pipeline):
+        print(f"📍 {r['_id']} : {r['count']} documents")
+
+    print("================================\n")
+
+# ==========================================================
+# ANALYSE HARMONIQUE
+# ==========================================================
+
+def analyse_harmonique_complete(df, colonne):
+
+    df_valid = df.dropna(subset=[colonne])
+    if len(df_valid) < 3:
+        return df
+
+    t0 = df_valid.index.min()
+    t = (df_valid.index - t0).total_seconds().values
+    y = df_valid[colonne].values
+    y_mean = np.mean(y)
+    y = y - y_mean
+
+    omega = {
+        "M2": 2*np.pi/(12.42*3600),
+        "S2": 2*np.pi/(12*3600),
+        "K1": 2*np.pi/(23.93*3600),
+        "O1": 2*np.pi/(25.82*3600),
+    }
+
+    X = [np.ones(len(t))]
+    for w in omega.values():
+        X.append(np.sin(w*t))
+        X.append(np.cos(w*t))
+    X = np.column_stack(X)
+
+    coeffs, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
+
+    t_all = (df.index - t0).total_seconds().values
+    X_all = [np.ones(len(t_all))]
+    for w in omega.values():
+        X_all.append(np.sin(w*t_all))
+        X_all.append(np.cos(w*t_all))
+    X_all = np.column_stack(X_all)
+
+    if X_all.shape[1] > len(coeffs):
+        X_all = X_all[:, :len(coeffs)]
+
+    df[colonne] = X_all @ coeffs + y_mean
+
+    return df
+
+# ==========================================================
+# LECTURE INCREMENTALE
 # ==========================================================
 
 def lire_lignes_incrementales(nom_fichier):
     if nom_fichier not in fichier_positions:
         fichier_positions[nom_fichier] = 0
-
     try:
-        with open(nom_fichier, "r", encoding="utf-8") as f:
+        with open(nom_fichier,"r",encoding="utf-8") as f:
             f.seek(fichier_positions[nom_fichier])
             lignes = f.readlines()
             fichier_positions[nom_fichier] = f.tell()
-            return [l for l in lignes if not l.startswith("Date")]
+        return [l for l in lignes if not l.startswith("Date")]
     except:
         return []
 
-def lire_fichier_param(station, param):
+def lire_fichier_param(station,param):
     nom = f"{station} {param}.txt"
     lignes = lire_lignes_incrementales(nom)
-
     if not lignes:
         return pd.DataFrame()
 
     df = pd.DataFrame(
         [l.strip().split("\t") for l in lignes],
-        columns=["Date", "Time", param, "SD"]
+        columns=["Date","Time",param,"SD"]
     )
 
-    df = df[df[param] != "9999.999"]
+    df = df[df[param]!="9999.999"]
 
     df["DateTime"] = pd.to_datetime(
-        df["Date"] + " " + df["Time"],
+        df["Date"]+" "+df["Time"],
         format="%d/%m/%Y %H:%M:%S",
         errors="coerce"
     )
 
-    df[param] = pd.to_numeric(df[param], errors="coerce")
+    df[param] = pd.to_numeric(df[param],errors="coerce")
 
-    return df[["DateTime", param]].dropna()
+    return df[["DateTime",param]].dropna()
 
 # ==========================================================
-# FUSION + INTERPOLATION + LISSAGE
+# TRAITEMENT COMPLET STATION
 # ==========================================================
 
 def fusionner_donnees_station(station):
 
-    dfs = []
+    dfs=[]
     for p in parametres:
-        df = lire_fichier_param(station, p)
-        if not df.empty:
-            dfs.append(df)
+        dfp = lire_fichier_param(station,p)
+        print(f"[DEBUG] {station} - {p}: {len(dfp)} points")
+        if not dfp.empty:
+            dfs.append(dfp)
 
     if not dfs:
         return pd.DataFrame()
 
-    df = dfs[0]
+    df=dfs[0]
     for other in dfs[1:]:
-        df = pd.merge(df, other, on="DateTime", how="outer")
+        df=pd.merge(df,other,on="DateTime",how="outer")
 
-    df["Station"] = station
-    df["Longitude"] = coordonnees_stations[station]["Longitude"]
-    df["Latitude"] = coordonnees_stations[station]["Latitude"]
+    df.sort_values("DateTime",inplace=True)
+    df.set_index("DateTime",inplace=True)
 
-    df = df.sort_values("DateTime")
-    df = df.set_index("DateTime")
-
-    # 🔹 NE SUPPRIME PLUS LES LIGNES
     for p in parametres:
         if p in df.columns:
-            if p in plages_valides:
-                minv, maxv = plages_valides[p]
-                df.loc[(df[p] < minv) | (df[p] > maxv), p] = np.nan
 
-            df[p] = df[p].interpolate(method="time")
+            minv,maxv = plages_valides[p]
+            df.loc[(df[p]<minv)|(df[p]>maxv),p]=np.nan
 
-            if len(df[p].dropna()) >= 5:
-                window = min(11, len(df[p]) // 2 * 2 + 1)
-                df[p] = savgol_filter(df[p], window_length=window, polyorder=2)
+            df[p]=df[p].interpolate(method="time")
 
-    # 🔹 Détection marées
+            if df[p].count()>=3:
+                window=min(11,len(df[p]))
+                if window%2==0:
+                    window-=1
+                if window>=3:
+                    tmp=df[p].interpolate(limit_direction="both")
+                    df[p]=savgol_filter(tmp,window_length=window,polyorder=2)
+
     if "TIDE HEIGHT" in df.columns:
-        tide = df["TIDE HEIGHT"]
-        df["TIDE_HIGH"] = (tide.shift(1) < tide) & (tide.shift(-1) < tide)
-        df["TIDE_LOW"] = (tide.shift(1) > tide) & (tide.shift(-1) > tide)
+        df=analyse_harmonique_complete(df,"TIDE HEIGHT")
+        tide=df["TIDE HEIGHT"]
+        df["TIDE_HIGH"]=(tide.shift(1)<tide)&(tide.shift(-1)<tide)
+        df["TIDE_LOW"]=(tide.shift(1)>tide)&(tide.shift(-1)>tide)
+
+    df["Station"]=station
+    df["Longitude"]=coordonnees_stations[station]["Longitude"]
+    df["Latitude"]=coordonnees_stations[station]["Latitude"]
 
     df.reset_index(inplace=True)
-    return df
+    return df.where(pd.notnull(df),None)
 
 # ==========================================================
-# MONGODB
+# MONGO
 # ==========================================================
 
 def connexion_mongo():
@@ -158,106 +229,58 @@ def connexion_mongo():
         tlsCAFile=certifi.where()
     )
 
-def inserer_dans_mongo(df, collection):
+def inserer_dans_mongo(df,collection):
     if df.empty:
-        return
+        return 0
+    ops=[UpdateOne(
+        {"DateTime":d["DateTime"],"Station":d["Station"]},
+        {"$set":d},
+        upsert=True
+    ) for d in df.to_dict("records")]
 
-    for doc in df.to_dict("records"):
-        collection.update_one(
-            {"DateTime": doc["DateTime"], "Station": doc["Station"]},
-            {"$set": doc},
-            upsert=True
-        )
-
-# ==========================================================
-# PDF + GRAPHIQUE
-# ==========================================================
-
-def generer_rapport_pdf(df, station):
-
-    if df.empty:
-        print(f"📭 Aucun rapport PDF pour {station}")
-        return
-
-    df = df.sort_values("DateTime")
-
-    plt.figure(figsize=(12,6))
-
-    for p in parametres:
-        if p in df.columns:
-            plt.plot(df["DateTime"].values, df[p].values, label=p)
-
-    if "TIDE HEIGHT" in df.columns:
-        plt.scatter(
-            df["DateTime"][df["TIDE_HIGH"]],
-            df["TIDE HEIGHT"][df["TIDE_HIGH"]],
-            color="red", marker="^"
-        )
-        plt.scatter(
-            df["DateTime"][df["TIDE_LOW"]],
-            df["TIDE HEIGHT"][df["TIDE_LOW"]],
-            color="blue", marker="v"
-        )
-
-    plt.legend(fontsize=7)
-    plt.grid(True)
-    plt.tight_layout()
-
-    graph_path = f"{station}_graph.png"
-    plt.savefig(graph_path)
-    plt.clf()
-    plt.close('all')
-    gc.collect()
-
-    fichier_pdf = os.path.join(
-        DOSSIER_PDF,
-        f"rapport_{station}_{datetime.now().strftime('%Y%m%d')}.pdf"
-    )
-
-    pdf = FPDF()
-    pdf.add_page()
-    pdf.set_font("Arial", "B", 14)
-    pdf.cell(0, 10, f"Rapport Météo - {station}", ln=True, align="C")
-    pdf.image(graph_path, x=10, y=30, w=190)
-    pdf.output(fichier_pdf)
-
-    os.remove(graph_path)
-
-    print(f"✅ Rapport généré : {fichier_pdf}")
+    if ops:
+        collection.bulk_write(ops)
+    return len(ops)
 
 # ==========================================================
-# BOUCLE PRINCIPALE
+# BOUCLE 24H/24
 # ==========================================================
 
 def boucle_suivi():
 
-    print("🟢 Suivi en cours... Ctrl+C pour quitter.")
+    print("🟢 SYSTEME ACTIF 24H/24")
+
+    client=connexion_mongo()
+    db=client["meteo_douala"]
+    collection=db["donnees_meteo"]
 
     while True:
-
         try:
-            client = connexion_mongo()
-            client.server_info()
+            print(f"\n🕒 Cycle {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-            db = client["meteo_douala"]
-            collection = db["donnees_meteo"]
+            total_cycle=0
 
             for station in coordonnees_stations.keys():
-                df = fusionner_donnees_station(station)
-                inserer_dans_mongo(df, collection)
-                generer_rapport_pdf(df, station)
+                df=fusionner_donnees_station(station)
+                nb=inserer_dans_mongo(df,collection)
+                total_cycle+=nb
+                print(f"✅ {station} : {nb} documents")
 
+            print(f"🔄 Total cycle : {total_cycle} documents")
 
-            gc.collect()
+            afficher_statistiques_base(client,db,collection)
+
             time.sleep(10)
 
-        except (ServerSelectionTimeoutError, AutoReconnect, ConfigurationError):
-            print("🔌 Connexion perdue. Reconnexion...")
+        except (ServerSelectionTimeoutError,AutoReconnect,ConfigurationError):
+            print("🔌 Reconnexion Mongo...")
+            time.sleep(5)
+
+        except Exception as e:
+            print("⚠️ Erreur :",e)
             time.sleep(5)
 
 # ==========================================================
 
-if __name__ == "__main__":
+if __name__=="__main__":
     boucle_suivi()
-
-  
