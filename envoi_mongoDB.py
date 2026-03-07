@@ -11,7 +11,7 @@ from datetime import datetime
 from pymongo.errors import ServerSelectionTimeoutError, AutoReconnect, ConfigurationError
 from scipy.signal import savgol_filter
 import certifi
-
+import math
 # ==========================================================
 # CONFIGURATION
 # ==========================================================
@@ -215,7 +215,7 @@ def fusionner_donnees_station(station):
     df["Latitude"]=coordonnees_stations[station]["Latitude"]
 
     df.reset_index(inplace=True)
-    return df.where(pd.notnull(df),None)
+    return df
 
 # ==========================================================
 # MONGO
@@ -232,11 +232,17 @@ def connexion_mongo():
 def inserer_dans_mongo(df,collection):
     if df.empty:
         return 0
+    # Convertir et nettoyer les NaN en None niveau dictionnaire standard python
+    records = []
+    for d in df.to_dict("records"):
+        cleaned_doc = {k: (None if isinstance(v, float) and math.isnan(v) else v) for k, v in d.items()}
+        records.append(cleaned_doc)
+
     ops=[UpdateOne(
         {"DateTime":d["DateTime"],"Station":d["Station"]},
         {"$set":d},
         upsert=True
-    ) for d in df.to_dict("records")]
+    ) for d in records]
 
     if ops:
         collection.bulk_write(ops)
